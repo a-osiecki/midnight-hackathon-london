@@ -1,0 +1,178 @@
+pragma language_version >= 0.18;
+
+import CompactStandardLibrary;
+import "../oz/access/Ownable" prefix Ownable_;
+import "../oz/token/FungibleToken" prefix Fungible_;
+
+/*
+  ===============================
+      HEALTH DATA MARKETPLACE
+  ===============================
+*/
+
+///////////////////
+// PRIVATE STATE //
+///////////////////
+
+// Witnesses used for identity management and nullifier creation
+witness secretKey(): Bytes<32>;
+witness encript(buyer_pk: Bytes<32>): Bytes<256>;
+witness desencript(encripted_data: Bytes<256>, buyer_sk: Bytes<32>): Boolean;
+
+
+// Data structure to hold user commitment information
+enum SexAssignedAtBirth {
+  Female,
+  Male,
+  Intersex
+}
+
+export struct MarketCriteria {
+  minAge: Uint<8>;
+  maxAge: Uint<8>;
+  minWeight: Uint<8>;
+  maxWeight: Uint<8>;
+  minHeight: Uint<8>;
+  maxHeight: Uint<8>;
+  smoker: Boolean;
+  allowChronic: Vector<100, Opaque<"string">>;
+  requiredSex: Maybe<SexAssignedAtBirth>;
+  city: Opaque<"string">;
+  state: Opaque<"string">;
+  country: Opaque<"string">;
+  // ...
+}
+
+export struct UserSuscription {
+  age: Uint<8>;
+  weight: Uint<8>;
+  height: Uint<8>;
+  smoker: Boolean;
+  chronicConditions: Vector<100, Opaque<"string">>;
+}
+
+//////////////////
+// PUBLIC STATE //
+//////////////////
+export ledger verifiedProviders: List<Bytes<32>>;                // Nullifier -> User commitment data
+export ledger providersToData: Map<Bytes<32>, Bytes<256>>;       // Nullifier -> provider data (encrypted blob)
+export ledger maximumProviders: Uint<32>;                        // Maximum number of data providers allowed
+export ledger compensation: Uint<32>;                            // Total compensation, in the Fungible token, that will be paid to each data provider
+export ledger elegibilityCriteria: MarketCriteria;               // Criteria for data providers to be eligible
+
+/*
+    CONSTRUCTOR
+*/
+constructor(
+  ownerPublicKey: ZswapCoinPublicKey,
+  rewardTokenSymbol: Opaque<"string">,
+  rewardTokenName: Opaque<"string">,
+  decimals: Uint<8>,
+  totalSupply: Uint<128>,
+  compensationPerProvider: Uint<32>,
+  maxProviders: Uint<32>,
+  criteria: MarketCriteria
+) {
+  // Initialize Ownable module with the deployer as owner
+  const own = left<ZswapCoinPublicKey, ContractAddress>(disclose(ownerPublicKey));
+  Ownable_initialize(own);
+
+  // Initialize Fungible Token module
+  Fungible_initialize(
+    rewardTokenSymbol,
+    rewardTokenName,
+    decimals,
+  );
+
+  // Initialize Data Marketplace state
+  compensation = disclose(compensationPerProvider);
+  maximumProviders = disclose(maxProviders);
+  elegibilityCriteria = disclose(criteria);
+}
+
+/*
+  User subsrcibes to the data marketplace by proving elegibility
+*/
+export circuit subscribe(
+  userDetails: UserSuscription,
+): [] {
+  assert(verifiedProviders.length() < maximumProviders, "Maximum number of providers reached");
+
+  // Verify user meets elegibility criteria
+  assert(disclose(userDetails.age) >= elegibilityCriteria.minAge, "User does not meet minimum age requirement");
+  assert(disclose(userDetails.age) <= elegibilityCriteria.maxAge, "User exceeds maximum age limit");
+  assert(disclose(userDetails.weight) >= elegibilityCriteria.minWeight, "User does not meet minimum weight requirement");
+  assert(disclose(userDetails.weight) <= elegibilityCriteria.maxWeight, "User exceeds maximum weight limit");
+  assert(disclose(userDetails.height) >= elegibilityCriteria.minHeight, "User does not meet minimum height requirement");
+  assert(disclose(userDetails.height) <= elegibilityCriteria.maxHeight, "User exceeds maximum height limit");
+  assert(disclose(userDetails.smoker) == elegibilityCriteria.smoker, "Smoker users are not eligible");
+  for (const condition of disclose(userDetails.chronicConditions)) {
+    const found: Boolean = false;
+    for (const element of elegibilityCriteria.allowChronic) {
+      if (element == condition) {
+        skip
+      }
+    }
+    assert(found, "User has disallowed chronic conditions");
+  }
+  if (elegibilityCriteria.requiredSex.isSome) {
+    assert(disclose(userDetails.sex) == elegibilityCriteria.requiredSex.value, "User does not meet required sex criteria");
+  }
+  verifiedProviders.append(disclose(nullify(secretKey(), pad(32, "subscription_salt"))));
+}
+
+export circuit commit(
+  encriptedData: Bytes<256>,
+): [] {
+  // Check if user is verified
+  const userNullifier = nullify(secretKey(), pad(32, "subscription_salt"));
+  assert(verifiedProviders.contains(disclose(userNullifier)), "User is not a verified provider");
+
+  // Check if user hasn't already commited
+  assert(!providersToData.contains(disclose(nullify(secretKey(), pad(32, "subscription_salt")))), "User has already committed data");
+
+  // Store encrypted data
+  providersToData.insert(disclose(userNullifier), disclose(encriptedData));
+}
+
+export circuit pay(
+  userNullifier: Bytes<32>,
+): [] {
+  // Only owner can pay
+  Ownable_assertOnlyOwner();
+
+  // Check if user is verified
+  assert(verifiedProviders.contains(disclose(userNullifier)), "User is not a verified provider");
+
+  // Check if data fits the format required by the buyer
+  const isDataVerified = desencript(
+    providersToData.get(disclose(userNullifier)),
+    secretKey()
+  );
+  if (isDataVerified) {
+    Fungible_transfer(
+      left<ZswapCoinPublicKey, ContractAddress>(disclose(userNullifier)),
+      compensation
+    );
+
+  } else {
+    // Data does not meet requirements, no payment, remove commitment
+    providersToData.remove(disclose(userNullifier));
+    assert(false, "Data does not meet buyer's requirements");
+  }
+}
+
+
+export circuit nullify(sk: Bytes<32>, salt: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "pk"), sk, salt]);
+}
+
+pure circuit contains<n>(vec: Vector<n, Field>, target: Field): Boolean {
+  const found = false;
+  for (const element of vec) {
+    if (element == target) {
+      found = true;
+    }
+  }
+  return found;
+}
